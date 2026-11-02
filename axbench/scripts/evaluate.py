@@ -38,10 +38,15 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import multiprocessing
 #multiprocessing.set_start_method("spawn", force=True)
 from axbench.utils.constants import *
-import stanza
+# stanza is not in pyproject/uv.lock
+nlp = None
 
-# Load the English pipeline
-nlp = stanza.Pipeline('en', processors='tokenize,pos', device = "cpu")
+def _load_stanza_nlp():
+    global nlp
+    if nlp is None:
+        import stanza
+        nlp = stanza.Pipeline('en', processors='tokenize,pos', device="cpu")
+    return nlp
 
 import logging
 logging.basicConfig(format='%(asctime)s,%(msecs)03d %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s',
@@ -357,7 +362,8 @@ def eval_steering_single_task(args_tuple):
     # Create LanguageModel instance within the worker process
     client = AsyncOpenAI(
         api_key=os.environ.get("OPENAI_API_KEY"),
-        timeout=60.0,
+        # increased time limit after experiencing some timeouts
+        timeout=600.0,
         http_client=httpx.AsyncClient(
             limits=httpx.Limits(
                 max_keepalive_connections=100, 
@@ -365,7 +371,7 @@ def eval_steering_single_task(args_tuple):
             ),
             headers={"Connection": "close"},
         ),
-        max_retries=3,
+        max_retries=8,
     )
     lm_model = LanguageModel(
         lm_model,
@@ -387,7 +393,7 @@ def eval_steering_single_task(args_tuple):
         if "Rule" in evaluator_name and current_df['input_concept'].iloc[0] in NEED_STANZA:
             evaluator = evaluator_class(
             model_name, dump_dir=dump_dir, 
-            concept_id=concept_id, lm_model=lm_model, winrate_baseline=winrate_baseline, steer_dataset_type=steer_dataset_type, nlp=nlp)
+            concept_id=concept_id, lm_model=lm_model, winrate_baseline=winrate_baseline, steer_dataset_type=steer_dataset_type, nlp=_load_stanza_nlp())
         else:
             evaluator = evaluator_class(
             model_name, dump_dir=dump_dir, 
@@ -552,9 +558,30 @@ def eval_steering(args):
             print("loading temp dfs")
             eval_dfs = pickle.load(f)
 
+    # Per-concept checkpointing: write out immediately (jsonl line + parquet rows + state file) so
+    # a killed run resumes at the next concept instead of re-evaluating all.
+    saved = set()
+
+    def flush(cid):
+        if cid in saved or cid < start_concept_id:
+            return
+        save_results(
+            dump_dir,
+            {"concept_id": cid + 1, "stanza": True},
+            cid,
+            args.mode,
+            all_results[cid],
+            eval_dfs[cid]
+        )
+        saved.add(cid)
+
+    prev_cid = None
     with ProcessPoolExecutor(max_workers=args.num_of_workers) as executor:
         for concept_id, evaluator_str, model_str, result, lm_report, lm_cache, current_df in executor.map(
             eval_steering_single_task, all_tasks):
+            if prev_cid is not None and concept_id != prev_cid:
+                flush(prev_cid)
+            prev_cid = concept_id
             if concept_id not in all_results:
                 all_results[concept_id] = {}
                 eval_dfs[concept_id] = {}
@@ -589,16 +616,9 @@ def eval_steering(args):
             logger.warning(f"Completed task for concept_id: {concept_id}, model: {model_str}, evaluator: {evaluator_str}")
 
         
-    for concept_id, eval_results in sorted(all_results.items()):
-        save_results(
-            dump_dir, 
-            {"concept_id": concept_id+1, "stanza": True}, 
-            concept_id, 
-            args.mode, 
-            eval_results, 
-            eval_dfs[concept_id]
-        )
-        
+    for concept_id in sorted(all_results):
+        flush(concept_id)
+
 
     if args.mode == "train_data":
         return
